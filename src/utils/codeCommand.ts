@@ -5,15 +5,21 @@ import {
   decrementReferenceCount,
   incrementReferenceCount,
 } from "./processCheck";
+import {HOME_DIR} from "../constants";
+import {join} from "path";
 
 export async function executeCodeCommand(args: string[] = []) {
   // Set environment variables
   const config = await readConfigFile();
+  const port = config.PORT || 3456;
   const env: Record<string, string> = {
     ...process.env,
     ANTHROPIC_AUTH_TOKEN: config?.APIKEY || "test",
     ANTHROPIC_API_KEY: '',
-    ANTHROPIC_BASE_URL: `http://127.0.0.1:${config.PORT || 3456}`,
+    ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
+    NO_PROXY: `127.0.0.1`,
+    DISABLE_TELEMETRY: 'true',
+    DISABLE_COST_WARNINGS: 'true',
     API_TIMEOUT_MS: String(config.API_TIMEOUT_MS ?? 600000), // Default to 10 minutes if not set
   };
   let settingsFlag: Record<string, any> | undefined;
@@ -63,7 +69,6 @@ export async function executeCodeCommand(args: string[] = []) {
   const stdioConfig: StdioOptions = config.NON_INTERACTIVE_MODE
     ? ["pipe", "inherit", "inherit"] // Pipe stdin for non-interactive
     : "inherit"; // Default inherited behavior
-
   const claudeProcess = spawn(
     claudePath + (joinedArgs ? ` ${joinedArgs}` : ""),
     [],
