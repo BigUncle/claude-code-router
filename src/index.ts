@@ -1,3 +1,4 @@
+import { FastifyRequest, FastifyReply } from "fastify";
 import { existsSync } from "fs";
 import { writeFile } from "fs/promises";
 import { homedir } from "os";
@@ -22,6 +23,12 @@ import JSON5 from "json5";
 import { IAgent } from "./agents/type";
 import agentsManager from "./agents";
 import { EventEmitter } from "node:events";
+
+interface CustomRequest extends FastifyRequest {
+  sessionId?: string;
+  agents?: string[];
+  body: unknown;
+}
 
 const event = new EventEmitter()
 
@@ -53,7 +60,7 @@ async function run(options: RunOptions = {}) {
   // Check if service is already running
   const isRunning = await isServiceRunning()
   if (isRunning) {
-    console.log("✅ Service is already running in the background.");
+    console.info("✅ Service is already running in the background.");
     return;
   }
 
@@ -73,40 +80,22 @@ async function run(options: RunOptions = {}) {
 
   const port = config.PORT || 3456;
 
-  // Save the PID of the background process
-  savePid(process.pid);
-
-  // Handle SIGINT (Ctrl+C) to clean up PID file
-  process.on("SIGINT", () => {
-    console.log("Received SIGINT, cleaning up...");
-    cleanupPidFile();
-    process.exit(0);
-  });
-
-  // Handle SIGTERM to clean up PID file
-  process.on("SIGTERM", () => {
-    cleanupPidFile();
-    process.exit(0);
-  });
-
   // Use port from environment variable if set (for background process)
   const servicePort = process.env.SERVICE_PORT
     ? parseInt(process.env.SERVICE_PORT)
     : port;
 
   // Configure logger based on config settings
-  const pad = num => (num > 9 ? "" : "0") + num;
-  const generator = (time, index) => {
-    if (!time) {
-      time = new Date()
-    }
+  const pad = (num: number) => (num > 9 ? "" : "0") + num;
+  const generator = (time: Date | number, index?: number) => {
+    const date = (typeof time === 'number') ? new Date(time) : time || new Date();
 
-    var month = time.getFullYear() + "" + pad(time.getMonth() + 1);
-    var day = pad(time.getDate());
-    var hour = pad(time.getHours());
-    var minute = pad(time.getMinutes());
+    const month = date.getFullYear() + "" + pad(date.getMonth() + 1);
+    const day = pad(date.getDate());
+    const hour = pad(date.getHours());
+    const minute = pad(date.getMinutes());
 
-    return `./logs/ccr-${month}${day}${hour}${minute}${pad(time.getSeconds())}${index ? `_${index}` : ''}.log`;
+    return `./logs/ccr-${month}${day}${hour}${minute}${pad(date.getSeconds())}${index ? `_${index}` : ''}.log`;
   };
   const loggerConfig =
     config.LOG !== false
@@ -138,17 +127,43 @@ async function run(options: RunOptions = {}) {
     logger: loggerConfig,
   });
 
+  // Save the PID of the background process
+  savePid(process.pid);
+
+  const shutdown = async (signal: string) => {
+    server.log.info(`Received ${signal}, shutting down gracefully...`);
+    let exitCode = 0;
+    try {
+      await server.close();
+      server.log.info("Server closed successfully");
+    } catch (error) {
+      server.log.error("Error during shutdown:", error);
+      exitCode = 1;
+    } finally {
+      cleanupPidFile();
+      process.exit(exitCode);
+    }
+  };
+
+  // Handle SIGINT (Ctrl+C) for graceful shutdown
+  process.on("SIGINT", () => shutdown("SIGINT"));
+
+  // Handle SIGTERM for graceful shutdown
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+
   // Add global error handlers to prevent the service from crashing
-  process.on("uncaughtException", (err) => {
-    server.log.error("Uncaught exception:", err);
+  process.on("uncaughtException", (err: Error) => {
+    server.log.error("Uncaught exception, initiating shutdown...", err);
+    shutdown("uncaughtException");
   });
 
-  process.on("unhandledRejection", (reason, promise) => {
-    server.log.error("Unhandled rejection at:", promise, "reason:", reason);
+  process.on("unhandledRejection", (reason: any, promise: Promise<any>) => {
+    server.log.error("Unhandled rejection, initiating shutdown... Reason:", reason);
+    shutdown("unhandledRejection");
   });
   // Add async preHandler hook for authentication
-  server.addHook("preHandler", async (req, reply) => {
-    return new Promise((resolve, reject) => {
+  server.addHook("preHandler", (req: CustomRequest, reply: FastifyReply) => {
+    return new Promise<void>((resolve, reject) => {
       const done = (err?: Error) => {
         if (err) reject(err);
         else resolve();
@@ -157,7 +172,7 @@ async function run(options: RunOptions = {}) {
       apiKeyAuth(config)(req, reply, done).catch(reject);
     });
   });
-  server.addHook("preHandler", async (req, reply) => {
+  server.addHook("preHandler", async (req: CustomRequest, reply: FastifyReply) => {
     if (req.url.startsWith("/v1/messages")) {
       const useAgents = []
 
@@ -171,10 +186,10 @@ async function run(options: RunOptions = {}) {
 
           // append agent tools
           if (agent.tools.size) {
-            if (!req.body?.tools?.length) {
-              req.body.tools = []
+            if (!(req.body as any).tools?.length) {
+              (req.body as any).tools = []
             }
-            req.body.tools.unshift(...Array.from(agent.tools.values()).map(item => {
+            (req.body as any).tools.unshift(...Array.from(agent.tools.values()).map(item => {
               return {
                 name: item.name,
                 description: item.description,
@@ -194,15 +209,15 @@ async function run(options: RunOptions = {}) {
       });
     }
   });
-  server.addHook("onError", async (request, reply, error) => {
+  server.addHook("onError", async (request: CustomRequest, reply: FastifyReply, error: Error) => {
     event.emit('onError', request, reply, error);
   })
-  server.addHook("onSend", (req, reply, payload, done) => {
+  server.addHook("onSend", (req: CustomRequest, reply: FastifyReply, payload: any, done: (err?: Error | null, value?: any) => void) => {
     if (req.sessionId && req.url.startsWith("/v1/messages")) {
       if (payload instanceof ReadableStream) {
         if (req.agents) {
           const abortController = new AbortController();
-          const eventStream = payload.pipeThrough(new SSEParserTransform())
+          const eventStream = payload.pipeThrough(new TextDecoderStream()).pipeThrough(new SSEParserTransform())
           let currentAgent: undefined | IAgent;
           let currentToolIndex = -1
           let currentToolName = ''
@@ -215,13 +230,17 @@ async function run(options: RunOptions = {}) {
             try {
               // 检测工具调用开始
               if (data.event === 'content_block_start' && data?.data?.content_block?.name) {
-                const agent = req.agents.find((name: string) => agentsManager.getAgent(name)?.tools.get(data.data.content_block.name))
-                if (agent) {
-                  currentAgent = agentsManager.getAgent(agent)
-                  currentToolIndex = data.data.index
-                  currentToolName = data.data.content_block.name
-                  currentToolId = data.data.content_block.id
-                  return undefined;
+                if (req.agents) {
+                  for (const name of req.agents) {
+                    const agent = agentsManager.getAgent(name);
+                    if (agent?.tools.get(data.data.content_block.name)) {
+                      currentAgent = agent;
+                      currentToolIndex = data.data.index;
+                      currentToolName = data.data.content_block.name;
+                      currentToolId = data.data.content_block.id;
+                      return undefined;
+                    }
+                  }
                 }
               }
 
@@ -256,17 +275,17 @@ async function run(options: RunOptions = {}) {
                   currentToolArgs = ''
                   currentToolId = ''
                 } catch (e) {
-                  console.log(e);
+                  server.log.error("Error processing tool call:", e);
                 }
                 return undefined;
               }
 
               if (data.event === 'message_delta' && toolMessages.length) {
-                req.body.messages.push({
+                (req.body as any).messages.push({
                   role: 'assistant',
                   content: assistantMessages
                 })
-                req.body.messages.push({
+                ;(req.body as any).messages.push({
                   role: 'user',
                   content: toolMessages
                 })
@@ -281,7 +300,7 @@ async function run(options: RunOptions = {}) {
                 if (!response.ok) {
                   return undefined;
                 }
-                const stream = response.body!.pipeThrough(new SSEParserTransform())
+                const stream = response.body!.pipeThrough(new TextDecoderStream()).pipeThrough(new SSEParserTransform())
                 const reader = stream.getReader()
                 while (true) {
                   try {
@@ -312,7 +331,7 @@ async function run(options: RunOptions = {}) {
               }
               return data
             }catch (error: any) {
-              console.error('Unexpected error in stream processing:', error);
+              server.log.error('Unexpected error in stream processing:', error);
 
               // 处理流提前关闭的错误
               if (error.code === 'ERR_STREAM_PREMATURE_CLOSE') {
@@ -341,14 +360,18 @@ async function run(options: RunOptions = {}) {
               const str = dataStr.slice(27);
               try {
                 const message = JSON.parse(str);
-                sessionUsageCache.put(req.sessionId, message.usage);
-              } catch {}
+                if (req.sessionId && message.usage) {
+                  sessionUsageCache.put(req.sessionId, message.usage);
+                }
+              } catch (e) {
+                server.log.error(e, `Failed to parse message usage JSON: ${str}`);
+              }
             }
           } catch (readError: any) {
             if (readError.name === 'AbortError' || readError.code === 'ERR_STREAM_PREMATURE_CLOSE') {
-              console.error('Background read stream closed prematurely');
+              server.log.warn('Background read stream closed prematurely');
             } else {
-              console.error('Error in background stream reading:', readError);
+              server.log.error('Error in background stream reading:', readError);
             }
           } finally {
             reader.releaseLock();
@@ -371,13 +394,19 @@ async function run(options: RunOptions = {}) {
     }
     done(null, payload)
   });
-  server.addHook("onSend", async (req, reply, payload) => {
+  server.addHook("onSend", async (req: CustomRequest, reply: FastifyReply, payload: any) => {
     event.emit('onSend', req, reply, payload);
     return payload;
   })
 
 
-  server.start();
+  server.log.info("Starting server");
+  try {
+    await server.start();
+  } catch (error) {
+    server.log.error("Error starting server:", error);
+    throw error;
+  }
 }
 
 export { run };
