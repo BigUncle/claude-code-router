@@ -4,4 +4,6 @@ log.txt
 .idea
 dist
 .DS_Store
+
 .vscode
+*.tsbuildinfo
